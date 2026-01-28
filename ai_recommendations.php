@@ -12,25 +12,56 @@ define("OPT_JOB", 3);
 define("JOB_GOVT", 0);
 define("JOB_PRIVATE", 1);
 
-/* ================= HELPER FUNCTIONS ================= */
+/* ================= INTEREST AREA MAPPING ================= */
 
-function encodeInterest($interestArea) {
+/**
+ * Maps interest areas to related stream keywords for matching
+ */
+function getInterestKeywords($interestArea) {
     switch ($interestArea) {
         case "Technology":
+            return ["engineering", "software", "technology", "computer", "bca", "b.tech", "it", "data", "science (pcm)"];
         case "Science":
-            return [1, 0, 0];
+            return ["science", "research", "medical", "mbbs", "pharmacy", "b.sc", "biology", "chemistry", "physics", "pcm", "pcb"];
         case "Commerce":
+            return ["commerce", "business", "finance", "accounting", "b.com", "bba", "ca", "cma", "mba", "banking"];
         case "Law":
-            return [0, 1, 0];
+            return ["law", "legal", "llb", "judiciary", "advocate"];
         case "Arts":
-            return [0, 0, 1];
+            return ["arts", "humanities", "literature", "history", "sociology", "communication", "media", "bfa", "design"];
         default:
-            return [0, 0, 0];
+            return [];
     }
 }
 
-function mapDifficulty($level) {
-    $level = strtolower(trim($level));
+/**
+ * Check if stream matches user's interest area
+ */
+function matchesInterest($streamData, $interestArea) {
+    $keywords = getInterestKeywords($interestArea);
+    if (empty($keywords)) return 50; // Neutral if no preference
+    
+    $matchScore = 0;
+    $searchText = strtolower(
+        ($streamData['stream_name'] ?? '') . ' ' .
+        ($streamData['who_should_choose'] ?? '') . ' ' .
+        ($streamData['career_scope'] ?? '') . ' ' .
+        ($streamData['description'] ?? '')
+    );
+    
+    foreach ($keywords as $keyword) {
+        if (strpos($searchText, strtolower($keyword)) !== false) {
+            $matchScore += 15;
+        }
+    }
+    
+    return min($matchScore, 35); // Cap at 35 points for interest match
+}
+
+/* ================= DIFFICULTY MATCHING ================= */
+
+function mapDifficultyLevel($level) {
+    $level = strtolower(trim($level ?? 'medium'));
     return match ($level) {
         "easy" => 1,
         "medium" => 2,
@@ -39,33 +70,216 @@ function mapDifficulty($level) {
     };
 }
 
+/**
+ * Score based on difficulty tolerance vs stream difficulty
+ */
+function scoreDifficultyMatch($streamDifficulty, $userTolerance) {
+    $streamLevel = mapDifficultyLevel($streamDifficulty);
+    
+    // Perfect match
+    if ($streamLevel == $userTolerance) {
+        return 15;
+    }
+    
+    // Close match (one level difference)
+    if (abs($streamLevel - $userTolerance) == 1) {
+        return 8;
+    }
+    
+    // Mismatch (two levels difference)
+    return 0;
+}
+
+/* ================= CAREER PREFERENCE MATCHING ================= */
+
+/**
+ * Check job type distribution for a stream from stream_jobs table
+ */
+function getStreamJobTypes($conn, $streamId) {
+    $q = $conn->prepare("
+        SELECT j.job_type, sj.eligibility_strength
+        FROM stream_jobs sj
+        JOIN jobs j ON j.job_id = sj.job_id
+        WHERE sj.stream_id = ?
+    ");
+    $q->bind_param("i", $streamId);
+    $q->execute();
+    $r = $q->get_result();
+    
+    $govtCount = 0;
+    $privateCount = 0;
+    
+    while ($row = $r->fetch_assoc()) {
+        $weight = ($row['eligibility_strength'] == 'PRIMARY') ? 2 : 1;
+        if (strtolower($row['job_type']) == 'government') {
+            $govtCount += $weight;
+        } else {
+            $privateCount += $weight;
+        }
+    }
+    
+    return ['govt' => $govtCount, 'private' => $privateCount];
+}
+
+/**
+ * Score based on career preference (govt/private) matching
+ */
+function scoreCareerPreference($jobTypeCounts, $careerPrefPrivate) {
+    $total = $jobTypeCounts['govt'] + $jobTypeCounts['private'];
+    if ($total == 0) return 10; // Neutral score if no data
+    
+    if ($careerPrefPrivate == JOB_PRIVATE) {
+        // User prefers private
+        $ratio = $jobTypeCounts['private'] / $total;
+    } else {
+        // User prefers government
+        $ratio = $jobTypeCounts['govt'] / $total;
+    }
+    
+    return round($ratio * 20); // Up to 20 points for preference match
+}
+
+/* ================= MAIN SCORING FUNCTIONS ================= */
+
+/**
+ * Calculate stream score using database data
+ */
+function calculateStreamScore($conn, $streamId, $streamData, $interestArea, $difficultyTol, $careerPref) {
+    // Base score
+    $score = 50;
+    
+    // Interest area matching (up to +35)
+    $score += matchesInterest($streamData, $interestArea);
+    
+    // Difficulty matching (up to +15)
+    $score += scoreDifficultyMatch($streamData['difficulty_level'] ?? 'Medium', $difficultyTol);
+    
+    // Career preference matching (up to +20)
+    $jobTypes = getStreamJobTypes($conn, $streamId);
+    $score += scoreCareerPreference($jobTypes, $careerPref);
+    
+    // Add some randomness for variety (±3)
+    $score += rand(-3, 3);
+    
+    return $score;
+}
+
+/**
+ * Calculate exam score based on education level relevance and exam role
+ */
+function calculateExamScore($conn, $examId, $educationLevel, $interestArea, $difficultyTol) {
+    // Base score
+    $score = 55;
+    
+    // Check exam role in stream_exams
+    $q = $conn->prepare("
+        SELECT se.exam_role, s.stream_name, s.who_should_choose, s.career_scope
+        FROM stream_exams se
+        JOIN streams s ON s.stream_id = se.stream_id
+        WHERE se.exam_id = ?
+        LIMIT 5
+    ");
+    $q->bind_param("i", $examId);
+    $q->execute();
+    $r = $q->get_result();
+    
+    $roleBonus = 0;
+    $interestBonus = 0;
+    
+    while ($row = $r->fetch_assoc()) {
+        // Exam role bonus
+        switch ($row['exam_role']) {
+            case 'MANDATORY':
+                $roleBonus = max($roleBonus, 20);
+                break;
+            case 'OPTIONAL':
+                $roleBonus = max($roleBonus, 12);
+                break;
+            case 'SCHOLARSHIP':
+                $roleBonus = max($roleBonus, 8);
+                break;
+        }
+        
+        // Interest area match from related stream
+        $streamMatch = matchesInterest($row, $interestArea);
+        $interestBonus = max($interestBonus, $streamMatch);
+    }
+    
+    $score += $roleBonus;
+    $score += min($interestBonus, 20); // Cap interest bonus at 20 for exams
+    
+    // Add some randomness
+    $score += rand(-2, 2);
+    
+    return $score;
+}
+
+/**
+ * Calculate job score based on eligibility and user preferences
+ */
+function calculateJobScore($conn, $jobId, $jobType, $educationLevel, $interestArea, $careerPref, $difficultyTol) {
+    // Base score
+    $score = 50;
+    
+    // Career preference matching (up to +25)
+    $isGovt = (strtolower($jobType) == 'government');
+    if (($careerPref == JOB_GOVT && $isGovt) || ($careerPref == JOB_PRIVATE && !$isGovt)) {
+        $score += 25;
+    } else {
+        $score += 10; // Still some score for opposite preference
+    }
+    
+    // Check eligibility strength from stream_jobs
+    $q = $conn->prepare("
+        SELECT sj.eligibility_strength, s.stream_name, s.who_should_choose, s.career_scope
+        FROM stream_jobs sj
+        JOIN streams s ON s.stream_id = sj.stream_id
+        WHERE sj.job_id = ?
+        LIMIT 5
+    ");
+    $q->bind_param("i", $jobId);
+    $q->execute();
+    $r = $q->get_result();
+    
+    $strengthBonus = 0;
+    $interestBonus = 0;
+    
+    while ($row = $r->fetch_assoc()) {
+        // Eligibility strength bonus
+        switch ($row['eligibility_strength']) {
+            case 'PRIMARY':
+                $strengthBonus = max($strengthBonus, 15);
+                break;
+            case 'SECONDARY':
+                $strengthBonus = max($strengthBonus, 8);
+                break;
+        }
+        
+        // Interest area match from related stream
+        $streamMatch = matchesInterest($row, $interestArea);
+        $interestBonus = max($interestBonus, $streamMatch);
+    }
+    
+    $score += $strengthBonus;
+    $score += min($interestBonus, 15); // Cap at 15 for jobs
+    
+    // Add some randomness
+    $score += rand(-2, 3);
+    
+    return $score;
+}
+
+/* ================= SCORE ADJUSTMENT FUNCTIONS ================= */
+
 function varyDifficulty($base, $index) {
     return max(1, min(3, $base + ($index % 2)));
 }
 
-/* ---------- ML Call ---------- */
-function getAIScore($payload) {
-    $ch = curl_init("http://127.0.0.1:5000/predict");
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => json_encode($payload),
-        CURLOPT_HTTPHEADER => ["Content-Type: application/json"]
-    ]);
-    $response = curl_exec($ch);
-    curl_close($ch);
-
-    $json = json_decode($response, true);
-    return $json["recommendation_score"] ?? 60;
-}
-
-/* ---------- Score Diversification ---------- */
 function diversifyScore($score, $index, $educationLevel) {
     $spread = ($educationLevel <= 1) ? 3 : 2;
     return $score - ($index * $spread) + rand(-1, 1);
 }
 
-/* ---------- Score Calibration ---------- */
 function calibrateScore($score, $educationLevel, $rank) {
     if ($educationLevel <= 1)      $boost = 10;
     elseif ($educationLevel == 2)  $boost = 8;
@@ -74,15 +288,12 @@ function calibrateScore($score, $educationLevel, $rank) {
     return $score + $boost - ($rank * 3);
 }
 
-/* ---------- Score Scaling ---------- */
 function scaleScore($score) {
     $scaled = ($score - 40) * 1.25;
     return max(55, min(95, round($scaled)));
 }
 
-/* ---------- SOFT FLOOR (KEY FIX) ---------- */
 function applySoftFloor($score, $rank) {
-
     $minRanges = [
         0 => 82, // top recommendation
         1 => 74, // second
@@ -92,13 +303,12 @@ function applySoftFloor($score, $rank) {
     $min = $minRanges[$rank] ?? 60;
 
     if ($score < $min) {
-        $score = $min + rand(0, 4); // soft lift, not fixed
+        $score = $min + rand(0, 4);
     }
 
     return min(95, $score);
 }
 
-/* ---------- Thresholds ---------- */
 function getThresholds($educationLevel) {
     if ($educationLevel <= 1)
         return ["stream" => 50, "exam" => 50, "job" => 50];
@@ -118,42 +328,35 @@ $difficultyTol  = (int)($input["difficulty_tolerance"] ?? 2);
 $riskTol        = (int)($input["risk_tolerance"] ?? 2);
 $interestArea   = $input["interest_area"] ?? "";
 
-[$it, $ic, $ia] = encodeInterest($interestArea);
-
 $streams = [];
 $exams   = [];
 $jobs    = [];
 
 /* ================= STREAMS ================= */
 
-$q = $conn->prepare("SELECT stream_id, difficulty_level FROM streams WHERE education_level_id = ?");
+$q = $conn->prepare("
+    SELECT stream_id, stream_name, description, who_should_choose, career_scope, difficulty_level 
+    FROM streams 
+    WHERE education_level_id = ?
+");
 $q->bind_param("i", $educationLevel);
 $q->execute();
 $r = $q->get_result();
 
 $index = 0;
 while ($row = $r->fetch_assoc()) {
-
-    $payload = [
-        "education_level" => $educationLevel,
-        "interest_tech" => $it,
-        "interest_commerce" => $ic,
-        "interest_arts" => $ia,
-        "career_preference_private" => $careerPref,
-        "difficulty_tolerance" => $difficultyTol,
-        "risk_tolerance" => $riskTol,
-        "option_type" => OPT_STREAM,
-        "option_difficulty" => varyDifficulty(mapDifficulty($row["difficulty_level"]), $index),
-        "option_job_type" => 0
-    ];
-
-    $raw     = getAIScore($payload);
+    $streamId = (int)$row["stream_id"];
+    
+    // Calculate score using database-driven algorithm
+    $raw = calculateStreamScore($conn, $streamId, $row, $interestArea, $difficultyTol, $careerPref);
+    
+    // Apply same adjustments as before
     $div     = diversifyScore($raw, $index, $educationLevel);
     $cal     = calibrateScore($div, $educationLevel, $index);
     $scaled  = scaleScore($cal);
     $final   = applySoftFloor($scaled, $index);
 
-    $streams[] = ["stream_id" => (int)$row["stream_id"], "score" => $final];
+    $streams[] = ["stream_id" => $streamId, "score" => $final];
     $index++;
 }
 
@@ -171,27 +374,17 @@ $r = $q->get_result();
 
 $index = 0;
 while ($row = $r->fetch_assoc()) {
-
-    $payload = [
-        "education_level" => $educationLevel,
-        "interest_tech" => $it,
-        "interest_commerce" => $ic,
-        "interest_arts" => $ia,
-        "career_preference_private" => $careerPref,
-        "difficulty_tolerance" => $difficultyTol,
-        "risk_tolerance" => $riskTol,
-        "option_type" => OPT_EXAM,
-        "option_difficulty" => varyDifficulty(2, $index),
-        "option_job_type" => 0
-    ];
-
-    $raw     = getAIScore($payload);
+    $examId = (int)$row["exam_id"];
+    
+    // Calculate score using database-driven algorithm
+    $raw = calculateExamScore($conn, $examId, $educationLevel, $interestArea, $difficultyTol);
+    
     $div     = diversifyScore($raw, $index, $educationLevel);
     $cal     = calibrateScore($div, $educationLevel, $index);
     $scaled  = scaleScore($cal);
     $final   = applySoftFloor($scaled, $index);
 
-    $exams[] = ["exam_id" => (int)$row["exam_id"], "score" => $final];
+    $exams[] = ["exam_id" => $examId, "score" => $final];
     $index++;
 }
 
@@ -209,29 +402,18 @@ $r = $q->get_result();
 
 $index = 0;
 while ($row = $r->fetch_assoc()) {
-
-    $jobType = strtolower($row["job_type"]) === "private" ? JOB_PRIVATE : JOB_GOVT;
-
-    $payload = [
-        "education_level" => $educationLevel,
-        "interest_tech" => $it,
-        "interest_commerce" => $ic,
-        "interest_arts" => $ia,
-        "career_preference_private" => $careerPref,
-        "difficulty_tolerance" => $difficultyTol,
-        "risk_tolerance" => $riskTol,
-        "option_type" => OPT_JOB,
-        "option_difficulty" => varyDifficulty(2, $index),
-        "option_job_type" => $jobType
-    ];
-
-    $raw     = getAIScore($payload);
+    $jobId = (int)$row["job_id"];
+    $jobType = $row["job_type"];
+    
+    // Calculate score using database-driven algorithm
+    $raw = calculateJobScore($conn, $jobId, $jobType, $educationLevel, $interestArea, $careerPref, $difficultyTol);
+    
     $div     = diversifyScore($raw, $index, $educationLevel);
     $cal     = calibrateScore($div, $educationLevel, $index);
     $scaled  = scaleScore($cal);
     $final   = applySoftFloor($scaled, $index);
 
-    $jobs[] = ["job_id" => (int)$row["job_id"], "score" => $final];
+    $jobs[] = ["job_id" => $jobId, "score" => $final];
     $index++;
 }
 
@@ -250,6 +432,16 @@ $jobs    = array_filter($jobs,    fn($j) => $j["score"] >= $thresholds["job"]);
 usort($allStreams, fn($a,$b) => $b["score"] <=> $a["score"]);
 usort($allExams,   fn($a,$b) => $b["score"] <=> $a["score"]);
 usort($allJobs,    fn($a,$b) => $b["score"] <=> $a["score"]);
+
+// Re-index filtered arrays
+$streams = array_values($streams);
+$exams   = array_values($exams);
+$jobs    = array_values($jobs);
+
+// Sort filtered arrays by score
+usort($streams, fn($a,$b) => $b["score"] <=> $a["score"]);
+usort($exams,   fn($a,$b) => $b["score"] <=> $a["score"]);
+usort($jobs,    fn($a,$b) => $b["score"] <=> $a["score"]);
 
 if (empty($streams)) $streams = array_slice($allStreams, 0, 3);
 if (empty($exams))   $exams   = array_slice($allExams, 0, 3);
